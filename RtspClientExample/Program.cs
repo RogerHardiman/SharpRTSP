@@ -6,6 +6,8 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Security.Cryptography;
+using Rtsp;
+using System.Threading.Tasks;
 
 namespace RtspClientExample
 {
@@ -14,7 +16,7 @@ namespace RtspClientExample
         static void Main(string[] args)
         {
             //String url = "rtsp://192.168.1.128/ch1.h264";    // IPS
-            String url = "rtsp://192.168.1.125/onvif-media/media.amp?profile=quality_h264"; // Axis
+            //String url = "rtsp://192.168.1.125/onvif-media/media.amp?profile=quality_h264"; // Axis
             //String url = "rtsp://user:password@192.168.1.102/onvif-media/media.amp?profile=quality_h264"; // Axis
             //String url = "rtsp://192.168.1.124/rtsp_tunnel?h26x=4&line=1&inst=1"; // Bosch
 
@@ -24,14 +26,38 @@ namespace RtspClientExample
             //String url = "rtsp://127.0.0.1:8554/h264ESVideoTest"; // Live555 Cygwin
             //String url = "rtsp://192.168.1.160:8554/h264ESVideoTest"; // Live555 Cygwin
             //String url = "rtsp://127.0.0.1:8554/h264ESVideoTest"; // Live555 Cygwin
-            // String url = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
+             String url = "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mov";
 
             // MJPEG Tests (Payload 26)
             //String url = "rtsp://192.168.1.125/onvif-media/media.amp?profile=mobile_jpeg";
 
 
+            // Start a Task that continually connects to the RTSP Server until ENTER is pressed
+            bool want_video = true;
+
             // Create a RTSP Client
-            RTSPClient c = new RTSPClient(url, RTSPClient.RTP_TRANSPORT.TCP);
+            Task rtspTask = new Task(delegate {
+                // Keep looping until want_video is false
+                while (want_video) {
+                    RTSPClient c = new RTSPClient(url, RTSPClient.RTP_TRANSPORT.TCP);
+
+                    // busy-wait  (//Todo. Change to a better implementation
+                    while ((c.CurrentStatus == RtspStatus.Connecting
+                            || c.CurrentStatus == RtspStatus.Connected)
+                           && want_video == true) {
+                        Thread.Sleep(250);
+                    }
+
+                    // Either CurrentStatus is ConnectionFailed or is Disconnected
+                    // OR want_video is now false
+                    c.Stop();
+
+
+                    // Wait 1 second before reconnecting, if we still want video
+                    if (want_video == true) Thread.Sleep(1000);
+                }
+            });
+            rtspTask.Start();
 
             // Wait for user to terminate programme
             // Check for null which is returned when running under some IDEs
@@ -45,7 +71,9 @@ namespace RtspClientExample
                 if (readline == null) Thread.Sleep(500);
             }
 
-            c.Stop();
+            want_video = false;
+
+            rtspTask.Wait(); // wait for Task to complete before exiting
 
         }
     }
@@ -74,22 +102,13 @@ namespace RtspClientExample
         System.Timers.Timer keepalive_timer = null;
         H264Payload h264Payload = new H264Payload();
 
+        public volatile RtspStatus CurrentStatus; // Connecting, Connected etc
+
         // Constructor
         public RTSPClient(String url, RTP_TRANSPORT rtp_transport)
         {
 
             Rtsp.RtspUtils.RegisterUri();
-
-            if (fs == null)
-            {
-                String now = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                String filename = "rtsp_capture_" + now + ".264";
-                fs = new FileStream(filename, FileMode.Create);
-
-                String filename2 = "rtsp_capture_" + now + ".raw";
-                fs2 = new StreamWriter(filename2);
-            }
-
 
             Console.WriteLine("Connecting to " + url);
             this.url = url;
@@ -109,6 +128,8 @@ namespace RtspClientExample
                 }
             }
 
+            Rtsp_Client_StatusChanged(this, new RtspStatusEventArgs(RtspStatus.Connecting));
+
             // Connect to a RTSP Server. The RTSP session is a TCP connection
             try
             {
@@ -117,20 +138,38 @@ namespace RtspClientExample
             catch
             {
                 Console.WriteLine("Error - did not connect");
+                Rtsp_Client_StatusChanged(this, new RtspStatusEventArgs(RtspStatus.ConnectFailed));
                 return;
             }
 
             if (rtsp_socket.Connected == false)
             {
                 Console.WriteLine("Error - did not connect");
+                Rtsp_Client_StatusChanged(this, new RtspStatusEventArgs(RtspStatus.ConnectFailed));
                 return;
             }
+
+            Rtsp_Client_StatusChanged(this, new RtspStatusEventArgs(RtspStatus.Connected));
+
+
+            String now = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            if (fs == null)
+            {
+                String filename = "rtsp_capture_" + now + ".264";
+                fs = new FileStream(filename, FileMode.Create);
+            }
+            if (fs2 == null) {
+                String filename2 = "rtsp_capture_" + now + ".raw";
+                fs2 = new StreamWriter(filename2);
+            }
+
 
             // Connect a RTSP Listener to the RTSP Socket (or other Stream) to send RTSP messages and listen for RTSP replies
             rtsp_client = new Rtsp.RtspListener(rtsp_socket);
 
             rtsp_client.MessageReceived += Rtsp_MessageReceived;
             rtsp_client.DataReceived += Rtp_DataReceived;
+            rtsp_client.StatusChanged += Rtsp_Client_StatusChanged;
 
             rtsp_client.Start(); // start listening for messages from the server (messages fire the MessageReceived event)
 
@@ -168,7 +207,7 @@ namespace RtspClientExample
             Rtsp.Messages.RtspRequest teardown_message = new Rtsp.Messages.RtspRequestTeardown();
             teardown_message.RtspUri = new Uri(url);
             teardown_message.Session = session;
-            rtsp_client.SendMessage(teardown_message);
+            if (rtsp_client != null) rtsp_client.SendMessage(teardown_message);
 
             // clear up any UDP sockets
             if (udp_pair != null) udp_pair.Stop();
@@ -177,14 +216,14 @@ namespace RtspClientExample
             if (keepalive_timer != null) keepalive_timer.Stop();
 
             // Drop the RTSP session
-            rtsp_client.Stop();
+            if (rtsp_client != null) rtsp_client.Stop();
 
         }
 
 
         int rtp_count = 0; // used for statistics
         // RTP packet (or RTCP packet) has been received.
-        public void Rtp_DataReceived(object sender, Rtsp.RtspChunkEventArgs e)
+        private void Rtp_DataReceived(object sender, Rtsp.RtspChunkEventArgs e)
         {
 
             Rtsp.Messages.RtspData data_received = e.Message as Rtsp.Messages.RtspData;
@@ -556,6 +595,12 @@ namespace RtspClientExample
 
         }
 
+        void Rtsp_Client_StatusChanged(object sender, Rtsp.RtspStatusEventArgs e)
+        {
+            Console.WriteLine("NEW STATUS is " + e.Status.ToString());
+            CurrentStatus = e.Status;
+        }
+
         void Timer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
         {
             // Send Keepalive message
@@ -566,7 +611,7 @@ namespace RtspClientExample
         }
 
         // Generate Digest Authorization
-        public string GenerateDigestAuthorization(string username, string password,
+        private string GenerateDigestAuthorization(string username, string password,
             string realm, string nonce, string url, string command)  {
 
             if (username == null || username.Length == 0) return null;
@@ -591,7 +636,7 @@ namespace RtspClientExample
         }
 
         // MD5 (lower case)
-        public string CalculateMD5Hash(MD5 md5_session, string input)
+        private string CalculateMD5Hash(MD5 md5_session, string input)
         {
             byte[] inputBytes = System.Text.Encoding.UTF8.GetBytes(input);
             byte[] hash = md5_session.ComputeHash(inputBytes);

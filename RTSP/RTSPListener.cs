@@ -58,6 +58,7 @@
         public void Start()
         {
             _listenTread = new Thread(new ThreadStart(DoJob));
+            _listenTread.Name = "DoJob";
             _listenTread.Start();
         }
 
@@ -71,6 +72,11 @@
             _transport.Close();
 
         }
+
+        /// <summary>
+        /// Enable auto reconnect.
+        /// </summary>
+        public bool AutoReconnect { get; set; }
 
         /// <summary>
         /// Occurs when message is received.
@@ -90,7 +96,7 @@
         }
 
         /// <summary>
-        /// Occurs when message is received.
+        /// Occurs when Data is received.
         /// </summary>
         public event EventHandler<RtspChunkEventArgs> DataReceived;
 
@@ -107,12 +113,29 @@
         }
 
         /// <summary>
+        /// Occurs when status changes.
+        /// </summary>
+        public event EventHandler<RtspStatusEventArgs> StatusChanged;
+
+        /// <summary>
+        /// Raises the <see cref="E:StatusChange"/> event.
+        /// </summary>
+        /// <param name="RtspStatusEventArgs">The <see cref="Rtsp.RtspStatusEventArgs"/> instance containing the event data.</param>
+        protected void OnStatusChange(RtspStatusEventArgs rtspStatusEventArgs)
+        {
+            EventHandler<RtspStatusEventArgs> handler = StatusChanged;
+
+            if (handler != null)
+                handler(this, rtspStatusEventArgs);
+        }
+
+        /// <summary>
         /// Does the reading job.
         /// </summary>
         /// <remarks>
         /// This method read one message from TCP connection.
         /// If it a response it add the associate question.
-        /// The sopping is made by the closing of the TCP connection.
+        /// The stopping is made by the closing of the TCP connection.
         /// </remarks>
         private void DoJob()
         {
@@ -170,7 +193,6 @@
                         _transport.Close();
                     }
                 }
-                _logger.Debug("Connection Close");
             }
             catch (IOException error)
             {
@@ -193,6 +215,10 @@
                 _logger.Warn("Unknow Error", error);
                 throw;
             }
+
+            _logger.Debug("Connection Close");
+            OnStatusChange(new RtspStatusEventArgs(RtspStatus.Disconnected));
+
         }
 
         [Serializable]
@@ -211,6 +237,7 @@
         /// </summary>
         /// <param name="message">A message.</param>
         /// <returns><see cref="true"/> if it is Ok, otherwise <see cref="false"/></returns>
+
         public bool SendMessage(RtspMessage message)
         {
             if (message == null)
@@ -219,6 +246,9 @@
 
             if (!_transport.Connected)
             {
+				if(!AutoReconnect)
+                	return false;
+
                 _logger.Warn("Reconnect to a client, strange !!");
                 try
                 {
@@ -317,6 +347,7 @@
                                 // the read is blocking, so if we got -1 it is because the client close;
                                 currentReadingState = ReadingState.End;
                                 needMoreChar = false;
+                                return null;
                                 break;
                             case '\n':
                                 oneLine = ASCIIEncoding.UTF8.GetString(buffer.ToArray());
@@ -364,8 +395,12 @@
                         if (currentMessage.Data.Length > 0)
                         {
                             // Read the remaning data
-                            byteReaden += commandStream.Read(currentMessage.Data, byteReaden,
-                                currentMessage.Data.Length - byteReaden);
+                            int byteCount = commandStream.Read(currentMessage.Data, byteReaden,
+                                                             currentMessage.Data.Length - byteReaden);
+                            if (byteCount <= 0) {
+                                return null;
+                            }
+                            byteReaden += byteCount;
                             _logger.Debug(CultureInfo.InvariantCulture, "Readen {0} byte of data", byteReaden);
                         }
                         // if we haven't read all go there again else go to end. 
@@ -374,19 +409,38 @@
                         break;
                     case ReadingState.InterleavedData:
                         currentMessage = new RtspData();
-                        ((RtspData)currentMessage).Channel = commandStream.ReadByte();
-                        size = (commandStream.ReadByte() << 8) + commandStream.ReadByte();
+                        int channelByte = commandStream.ReadByte();
+                        if (channelByte == -1) {
+                            return null;
+                        }
+                        ((RtspData)currentMessage).Channel = channelByte;
+
+                        int sizeByte1 = commandStream.ReadByte();
+                        if (sizeByte1 == -1) {
+                            return null;
+                        }
+                        int sizeByte2 = commandStream.ReadByte();
+                        if (sizeByte2 == -1) {
+                            return null;
+                        }
+                        size = (sizeByte1 << 8) + sizeByte2;
                         currentMessage.Data = new byte[size];
                         currentReadingState = ReadingState.MoreInterleavedData;
                         break;
                     case ReadingState.MoreInterleavedData:
                         // apparently non blocking
-                        byteReaden += commandStream.Read(currentMessage.Data, byteReaden, size - byteReaden);
+                        {
+                        int byteCount = commandStream.Read(currentMessage.Data, byteReaden, size - byteReaden);
+                        if (byteCount <= 0) {
+                            return null;
+                        }
+                        byteReaden += byteCount;
                         if (byteReaden < size)
                             currentReadingState = ReadingState.MoreInterleavedData;
                         else
                             currentReadingState = ReadingState.End;
                         break;
+                        }
                     default:
                         break;
                 }
@@ -428,7 +482,10 @@
 
             if (!_transport.Connected)
             {
-                _logger.Warn("Reconnect to a client, strange !!");
+                if(!AutoReconnect)
+                    return null; // cannot write when transport is disconnected
+
+                _logger.Warn("Reconnect to a client, strange !");
                 Reconnect();
             }
 
@@ -473,6 +530,9 @@
 
             if (!_transport.Connected)
             {
+                if(!AutoReconnect)
+                    return;
+ 
                 _logger.Warn("Reconnect to a client, strange !!");
                 Reconnect();
             }
