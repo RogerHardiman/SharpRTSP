@@ -10,6 +10,8 @@ namespace RtspClientExample
 
     public class H264Payload
     {
+        const int log_level = 1; // change to 2 for extra log information
+
         int norm, fu_a, fu_b, stap_a, stap_b, mtap16, mtap24 = 0; // used for diagnostics stats
 
         List<byte[]> temporary_rtp_payloads = new List<byte[]>(); // used to assemble the RTP packets that form one RTP Frame
@@ -60,14 +62,14 @@ namespace RtspClientExample
                 // So write the NAL to the file
                 if (nal_header_type >= 1 && nal_header_type <= 23)
                 {
-                    Console.WriteLine("Normal NAL");
+                    if (log_level >= 2) Console.WriteLine("Normal NAL");
                     norm++;
                     nal_units.Add(rtp_payloads[payload_index]);
                 }
                 // There are 4 types of Aggregation Packet (split over RTP payloads)
                 else if (nal_header_type == 24)
                 {
-                    Console.WriteLine("Agg STAP-A");
+                    if (log_level >= 2) Console.WriteLine("Agg STAP-A");
                     stap_a++;
 
                     // RTP packet contains multiple NALs, each with a 16 bit header
@@ -109,7 +111,7 @@ namespace RtspClientExample
                 }
                 else if (nal_header_type == 28)
                 {
-                    Console.WriteLine("Frag FU-A");
+                    if (log_level >= 2) Console.WriteLine("Frag FU-A");
                     fu_a++;
 
                     // Parse Fragmentation Unit Header
@@ -118,7 +120,7 @@ namespace RtspClientExample
                     int fu_header_r = (rtp_payloads[payload_index][1] >> 5) & 0x01;  // reserved. should be 0
                     int fu_header_type = (rtp_payloads[payload_index][1] >> 0) & 0x1F; // Original NAL unit header
 
-                    Console.WriteLine("Frag FU-A s=" + fu_header_s + "e=" + fu_header_e);
+                    if (log_level >= 2) Console.WriteLine("Frag FU-A s=" + fu_header_s + "e=" + fu_header_e);
 
                     // Check Start and End flags
                     if (fu_header_s == 1 && fu_header_e == 0)
