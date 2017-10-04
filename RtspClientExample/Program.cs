@@ -34,17 +34,37 @@ namespace RtspClientExample
 
             // Start a Task that continually connects to the RTSP Server until ENTER is pressed
             bool want_video = true;
+            bool want_play = false;
+            bool want_pause = false;
 
-            // Create a RTSP Client
+            // Create a RTSP Client. This is created in a Task so that it can connect (and re-connect)
+            // in parallel with the User Interface (readline)
             Task rtspTask = new Task(delegate {
                 // Keep looping until want_video is false
                 while (want_video) {
                     RTSPClient c = new RTSPClient(url, RTSPClient.RTP_TRANSPORT.TCP);
+                    c.Received_SPS32_PPS32 += (byte[] sps32, byte[] pps32) => {
+                        Console.WriteLine("Received SPS and PPS from RTSP Client");
+                        // Pass this data into a H264 decoder
+                    };
+                    c.Received_NAL32 += (byte[] nal32) => {
+                        Console.WriteLine("Received NALs from RTSP Client");
+                        // Pass this data into a H264 decoder
+                    };
 
                     // busy-wait  (//Todo. Change to a better implementation
                     while ((c.CurrentStatus == RtspStatus.Connecting
                             || c.CurrentStatus == RtspStatus.Connected)
                            && want_video == true) {
+
+                        if (want_play) {
+                            c.Play();
+                            want_play = false;
+                        }
+                        if (want_pause) {
+                            c.Pause();
+                            want_pause = false;
+                        }
                         Thread.Sleep(250);
                     }
 
@@ -61,17 +81,26 @@ namespace RtspClientExample
 
             // Wait for user to terminate programme
             // Check for null which is returned when running under some IDEs
-            Console.WriteLine("Press ENTER to exit");
+            Console.WriteLine("Press 1 then ENTER to play");
+            Console.WriteLine("Press 2 then ENTER to pause");
+            Console.WriteLine("Press Q then ENTER to quit");
 
             String readline = null;
-            while (readline == null) {
+            while (want_video == true) {
                 readline = Console.ReadLine();
 
-                // Avoid maxing out CPU on systems that instantly return null for ReadLine
-                if (readline == null) Thread.Sleep(500);
+                if (readline == null) {
+                    // Avoid maxing out CPU on systems that instantly return null for ReadLine
+                    Thread.Sleep(500);
+                } else if (readline.Equals("1")) {
+                    want_play = true;
+                } else if (readline.Equals("2")) {
+                    want_pause = true;
+                } else if (readline.ToUpper().Equals("Q")) {
+                    want_video = false;
+                }
             }
 
-            want_video = false;
 
             rtspTask.Wait(); // wait for Task to complete before exiting
 
@@ -81,6 +110,15 @@ namespace RtspClientExample
 
     class RTSPClient
     {
+
+        // Events that applications can receive
+        public event Received_SPS32_PPS32Handler  Received_SPS32_PPS32;
+        public event Received_NAL32Handler        Received_NAL32;
+
+        // Delegated functions (essentially the function prototype)
+        public delegate void Received_SPS32_PPS32Handler (byte[] sps32, byte[] pps32);
+        public delegate void Received_NAL32Handler (byte[] nal32);
+
         public enum RTP_TRANSPORT { UDP, TCP, MULTICAST };
 
         Rtsp.RtspTcpTransport rtsp_socket = null; // RTSP connection
@@ -101,6 +139,8 @@ namespace RtspClientExample
         StreamWriter fs2 = null; // used to write Log Messages to a file. (should switch to NLog)
         System.Timers.Timer keepalive_timer = null;
         H264Payload h264Payload = new H264Payload();
+
+        bool write_log_files = true;
 
         public volatile RtspStatus CurrentStatus; // Connecting, Connected etc
 
@@ -153,7 +193,7 @@ namespace RtspClientExample
 
 
             String now = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            if (fs == null)
+            if (write_log_files == true)
             {
                 String filename = "rtsp_capture_" + now + ".264";
                 fs = new FileStream(filename, FileMode.Create);
@@ -201,6 +241,23 @@ namespace RtspClientExample
             options_message.RtspUri = new Uri(this.url);
             rtsp_client.SendMessage(options_message);
         }
+
+        public void Pause()
+        {
+            Rtsp.Messages.RtspRequest pause_message = new Rtsp.Messages.RtspRequestPause();
+            pause_message.RtspUri = new Uri(url);
+            pause_message.Session = session;
+            if (rtsp_client != null) rtsp_client.SendMessage(pause_message);
+        }
+
+        public void Play()
+        {
+            Rtsp.Messages.RtspRequest play_message = new Rtsp.Messages.RtspRequestPlay();
+            play_message.RtspUri = new Uri(url);
+            play_message.Session = session;
+            if (rtsp_client != null) rtsp_client.SendMessage(play_message);
+        }
+
 
         public void Stop()
         {
@@ -653,13 +710,35 @@ namespace RtspClientExample
         // Output SPS and PPS
         // When writing to a .264 file we will add the Start Code 0x00 0x00 0x00 0x01 before the SPS and before the PPS
         private void Output_SPS_PPS(byte[] sps, byte[] pps) {
-            if (fs == null) return; // check filestream initialised
+            if (fs != null) {
+                fs.Write(new byte[] { 0x00, 0x00, 0x00, 0x01 }, 0, 4);  // Write Start Code
+                fs.Write(sps, 0, sps.Length);                           // Write SPS
+                fs.Write(new byte[] { 0x00, 0x00, 0x00, 0x01 }, 0, 4);  // Write Start Code
+                fs.Write(pps, 0, pps.Length);                           // Write PPS
+                fs.Flush(true);
+            }
 
-            fs.Write(new byte[] { 0x00, 0x00, 0x00, 0x01 }, 0, 4);  // Write Start Code
-            fs.Write(sps, 0, sps.Length);                           // Write SPS
-            fs.Write(new byte[] { 0x00, 0x00, 0x00, 0x01 }, 0, 4);  // Write Start Code
-            fs.Write(pps, 0, pps.Length);                           // Write PPS
-            fs.Flush(true);
+            // Event Handler
+            if (Received_SPS32_PPS32 != null) {
+                // Convert data into an SPS and a PPS with a 32 bit size header
+                byte[]sps32 = new byte[sps.Length + 4];
+                sps32[0] = (byte)((sps.Length >> 24) & 0xFF);
+                sps32[1] = (byte)((sps.Length >> 16) & 0xFF);
+                sps32[2] = (byte)((sps.Length >> 8) & 0xFF);
+                sps32[3] = (byte)((sps.Length >> 0) & 0xFF);
+                System.Array.Copy(sps,0,sps32,4,sps.Length);
+
+                byte[] pps32 = new byte[pps.Length + 4];
+                pps32[0] = (byte)((pps.Length >> 24) & 0xFF);
+                pps32[1] = (byte)((pps.Length >> 16) & 0xFF);
+                pps32[2] = (byte)((pps.Length >> 8) & 0xFF);
+                pps32[3] = (byte)((pps.Length >> 0) & 0xFF);
+                System.Array.Copy(pps,0,pps32,4,pps.Length);
+
+                // Fire the event
+                Received_SPS32_PPS32(sps32,pps32);
+            }
+
         }
 
         // Output an array of NAL Units.
@@ -671,14 +750,35 @@ namespace RtspClientExample
         // when outputting data for H264 decoders, please note that some decoders require a 32 bit size length header before each NAL unit instead of the Start Code
         private void Output_NAL(List<byte[]> nal_units)
         {
-            if (fs == null) return; // check filestream initialised
+            if (fs != null) {
 
-            foreach (byte[] nal_unit in nal_units)
-            {
-                fs.Write(new byte[] { 0x00, 0x00, 0x00, 0x01 }, 0, 4);  // Write Start Code
-                fs.Write(nal_unit, 0, nal_unit.Length);           // Write NAL
+                foreach (byte[] nal in nal_units)
+                {
+                    fs.Write(new byte[] { 0x00, 0x00, 0x00, 0x01 }, 0, 4);  // Write Start Code
+                    fs.Write(nal, 0, nal.Length);           // Write NAL
+                }
+                fs.Flush(true);
             }
-            fs.Flush(true);
+
+            // create a single array containing all the NALs with a 32 bit size header
+            int nal32_size = 0;
+            foreach (var nal in nal_units) nal32_size += (nal.Length +4); // add up total size of nal32
+
+            byte[] nal32 = new byte[nal32_size];
+            int dst_ptr = 0;
+            foreach (var nal in nal_units) {
+                // put 4 byte header into NAL32 array
+                nal32[dst_ptr++] = (byte)((nal.Length >> 24) & 0xFF);
+                nal32[dst_ptr++] = (byte)((nal.Length >> 16) & 0xFF);
+                nal32[dst_ptr++] = (byte)((nal.Length >> 8) & 0xFF);
+                nal32[dst_ptr++] = (byte)((nal.Length >> 0) & 0xFF);
+                System.Array.Copy(nal,0,nal32,dst_ptr,nal.Length);
+            }
+            if (Received_NAL32 != null) {
+                // fire the Event
+                Received_NAL32(nal32);
+            }
+
         }
     }
 }
