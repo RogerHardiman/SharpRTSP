@@ -24,6 +24,7 @@ namespace RtspClientExample
         public delegate void Received_NAL32Handler (byte[] nal32);
 
         public enum RTP_TRANSPORT { UDP, TCP, MULTICAST };
+        private enum AUTHENTICATION { NONE, BASIC, DIGEST };
 
         Rtsp.RtspTcpTransport rtsp_socket = null; // RTSP connection
         Rtsp.RtspListener rtsp_client = null;   // this wraps around a the RTSP tcp_socket stream
@@ -33,8 +34,9 @@ namespace RtspClientExample
         String username = "";            // Username
         String password = "";            // Password
         String session = "";             // RTSP Session
-        String realm = null;             // cached from most recent WWW-Authenticate reply
-        String nonce = null;             // cached from most recent WWW-Authenticate reply
+        AUTHENTICATION authentication = AUTHENTICATION.NONE;
+        String realm = null;             // cached from most recent WWW-Authenticate Digest reply
+        String nonce = null;             // cached from most recent WWW-Authenticate Digest reply
         int video_payload = -1;          // Payload Type for the Video. (often 96 which is the first dynamic payload value)
         int video_data_channel = -1;     // RTP Channel Number used for the video stream or the UDP port number
         int video_rtcp_channel = -1;     // RTP Channel Number used for the rtcp status report messages OR the UDP port number
@@ -308,23 +310,32 @@ namespace RtspClientExample
 
             Console.WriteLine("Received " + message.OriginalRequest.ToString());
 
-            // Check if the Message has an Authenticate header. If so we update the 'realm' and 'nonce'
+            // Check if the Message has an Authenticate header and what type it is
             if (message.Headers.ContainsKey(RtspHeaderNames.WWWAuthenticate)) {
                 String www_authenticate = message.Headers[RtspHeaderNames.WWWAuthenticate];
 
                 // Parse www_authenticate
-                // EG:   Digest realm="AXIS_WS_ACCC8E3A0A8F", nonce="000057c3Y810622bff50b36005eb5efeae118626a161bf", stale=FALSE
-                string[] items = www_authenticate.Split(new char[] { ',' , ' ' });
-                foreach (string item in items) {
-                    // Split on the = symbol and load in
-                    string[] parts = item.Split(new char[] { '=' });
-                    if (parts.Count() >= 2 && parts[0].Trim().Equals("realm"))
-                        realm = parts[1].Trim(new char[] {' ','\"'}); // trim space and quotes
-                    else if (parts.Count() >= 2 && parts[0].Trim().Equals("nonce"))
-                        nonce = parts[1].Trim(new char[] {' ','\"'}); // trim space and quotes
+                // EG:   WWW-Authenticate: Basic realm="xxxxxxx"
+                // EG:   WWW-Authenticate: Digest realm="AXIS_WS_ACCC8E3A0A8F", nonce="000057c3Y810622bff50b36005eb5efeae118626a161bf", stale=FALSE
+                string[] items = www_authenticate.Split(new char[] { ',' , ' ' }); // split on Comma and Space
+
+                // Process the first item
+                if (items.Count() >= 1 && items[0].Equals("Basic")) {
+                    authentication = AUTHENTICATION.BASIC;
+                } else if (items.Count() >= 1 && items[0].Equals("Digest")) {
+                    authentication = AUTHENTICATION.DIGEST;
                 }
 
-                Console.WriteLine("WWW Authorize parsed for " + realm + " " + nonce);
+                // Process the remaining items
+                for (int i = 1; i < items.Count(); i++) {
+                   string[] parts = items[i].Split(new char[] { '=' }); // Split on Equals
+                    if (parts.Count() >= 2 && parts[0].Trim().Equals("realm")) {
+                        realm = parts[1].Trim(new char[] {' ','\"'}); // trim space and quotes
+                    }
+                    else if (parts.Count() >= 2 && parts[0].Trim().Equals("nonce")) {
+                        nonce = parts[1].Trim(new char[] {' ','\"'}); // trim space and quotes
+                    }
+                }
             }
 
 
@@ -358,26 +369,28 @@ namespace RtspClientExample
 
                 // Got a reply for DESCRIBE
 
-                // First time we send DESCRIBE we will not have the authorization Nonce so we
-                // handle the Unauthorized 401 error here and send a new DESCRIBE message
+                // First time we send DESCRIBE we do not add any authorization (and we could not add it even if we wanted to
+                // as we will not have the authorization Nonce value required for Digest mode
+                // So we have to handle the Unauthorized 401 error here and send a new DESCRIBE message
 
                 if (message.IsOk == false) {
                     Console.WriteLine("Got Error in DESCRIBE Reply " + message.ReturnCode + " " + message.ReturnMessage);
 
                     if (message.ReturnCode == 401 && (message.OriginalRequest.Headers.ContainsKey(RtspHeaderNames.Authorization)==false)) {
-                        // Error 401 - Unauthorized, but the request did not use Authorizarion.
+                        // Error 401 - Unauthorized, but the original request did not use Authorization so try again with Authorization added
 
                         if (username == null || password == null) {
                             // we do nothave a username or password. Abort
                             return;
                         }
                         // Send a new DESCRIBE with authorization
-                        String digest_authorization = GenerateDigestAuthorization(username,password,
-                                                                                realm,nonce,url,"DESCRIBE");
-                        
                         Rtsp.Messages.RtspRequest describe_message = new Rtsp.Messages.RtspRequestDescribe();
                         describe_message.RtspUri = new Uri(url);
-                        if (digest_authorization!=null) describe_message.Headers.Add(RtspHeaderNames.Authorization,digest_authorization);
+                        if (authentication != AUTHENTICATION.NONE) {
+                            String authorization_string = GenerateAuthorization(username,password,authentication,
+                                                                                          realm,nonce,url,"DESCRIBE");
+                            if (authorization_string != null) describe_message.Headers.Add("Authorization",authorization_string);
+                        }
                         rtsp_client.SendMessage(describe_message);
                         return;
                     } else if (message.ReturnCode == 401 && (message.OriginalRequest.Headers.ContainsKey(RtspHeaderNames.Authorization)==true)) {
@@ -486,15 +499,15 @@ namespace RtspClientExample
                                 };
                             }
 
-                            // Add authorization (if there is a username and password)
-                            String digest_authorization = GenerateDigestAuthorization(username,password,
-                                                                                  realm,nonce,url,"SETUP");
-
                             // Send SETUP
                             Rtsp.Messages.RtspRequestSetup setup_message = new Rtsp.Messages.RtspRequestSetup();
                             setup_message.RtspUri = new Uri(control);
                             setup_message.AddTransport(transport);
-                            if (digest_authorization!=null) setup_message.Headers.Add("Authorization",digest_authorization);
+                            if (authentication != AUTHENTICATION.NONE) {
+                                String authorization_string = GenerateAuthorization(username,password,authentication,
+                                                                                      realm,nonce,url,"SETUP");
+                                if (authorization_string != null) setup_message.Headers.Add("Authorization",authorization_string);
+                            }
                             rtsp_client.SendMessage(setup_message);
                         }
                     }
@@ -539,6 +552,12 @@ namespace RtspClientExample
                 Rtsp.Messages.RtspRequest play_message = new Rtsp.Messages.RtspRequestPlay();
                 play_message.RtspUri = new Uri(url);
                 play_message.Session = session;
+                if (authentication != AUTHENTICATION.NONE) {
+                    String authorization_string = GenerateAuthorization(username,password,authentication,
+                                                                                          realm,nonce,url,"PLAY");
+                    if (authorization_string != null) play_message.Headers.Add("Authorization",authorization_string);
+                }
+
                 rtsp_client.SendMessage(play_message);
             }
 
@@ -571,29 +590,38 @@ namespace RtspClientExample
 
         }
 
-        // Generate Digest Authorization
-        private string GenerateDigestAuthorization(string username, string password,
-            string realm, string nonce, string url, string command)  {
+        // Generate Basic or Digest Authorization
+        private string GenerateAuthorization(string username, string password,
+            AUTHENTICATION authentication, string realm, string nonce, string url, string command)  {
 
             if (username == null || username.Length == 0) return null;
             if (password == null || password.Length == 0) return null;
             if (realm == null || realm.Length == 0) return null;
-            if (nonce == null || nonce.Length == 0) return null;
+
+            if (authentication == AUTHENTICATION.BASIC) {
+                String basic_authorization = "Basic " + System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(username + ":" + password));
+                return basic_authorization;
+            }
+
+            else if (authentication == AUTHENTICATION.DIGEST) {
+                if (nonce == null || nonce.Length == 0) return null;
            
-            MD5 md5 = System.Security.Cryptography.MD5.Create();
-            String hashA1 = CalculateMD5Hash(md5, username+":"+realm+":"+password);
-            String hashA2 = CalculateMD5Hash(md5, command + ":" + url);
-            String response = CalculateMD5Hash(md5, hashA1 + ":" + nonce + ":" + hashA2);
+                MD5 md5 = System.Security.Cryptography.MD5.Create();
+                String hashA1 = CalculateMD5Hash(md5, username+":"+realm+":"+password);
+                String hashA2 = CalculateMD5Hash(md5, command + ":" + url);
+                String response = CalculateMD5Hash(md5, hashA1 + ":" + nonce + ":" + hashA2);
 
-            const String quote = "\"";
-            String digest_authorization = "Digest username=" + quote + username + quote +", "
-                + "realm=" + quote + realm + quote + ", "
-                + "nonce=" + quote + nonce + quote + ", "
-                + "uri=" + quote + url + quote + ", "
-                + "response=" + quote + response + quote;
+                const String quote = "\"";
+                String digest_authorization = "Digest username=" + quote + username + quote +", "
+                    + "realm=" + quote + realm + quote + ", "
+                    + "nonce=" + quote + nonce + quote + ", "
+                    + "uri=" + quote + url + quote + ", "
+                    + "response=" + quote + response + quote;
 
-            return digest_authorization;
-            
+                return digest_authorization;
+            }
+            else return null;
+                
         }
 
         // MD5 (lower case)
